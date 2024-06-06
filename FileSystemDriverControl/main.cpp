@@ -1,0 +1,343 @@
+#include <windows.h>
+#include <fltuser.h>
+#include <TlHelp32.h>
+#include <Psapi.h>
+#include <iostream>
+#include <fstream>
+#include <set>
+#include <dontuse.h>
+#include <ctime>
+
+#define CLIENT_SIDE
+#include "../FileSystemDriver/FileSystemDriver.h"
+#include "ProcInfo.h"
+
+#define MSG_WAIT_TIMEOUT 1000
+
+BOOL gCloseFlag = FALSE;
+
+BOOL SetMaxConsoleSize()
+{
+	HANDLE console = ::GetStdHandle(STD_OUTPUT_HANDLE);
+	if (console == INVALID_HANDLE_VALUE)
+	{
+		std::wcerr << L"Can't get output device handle! Errorcode: " << ::GetLastError() << std::endl;
+		return FALSE;
+	}
+
+	CONSOLE_SCREEN_BUFFER_INFO consoleInfo;
+	memset(&consoleInfo, 0, sizeof(CONSOLE_SCREEN_BUFFER_INFO));
+
+	if (!::GetConsoleScreenBufferInfo(console, &consoleInfo))
+	{
+		std::wcerr << L"Can't get console info! Errorcode: " << ::GetLastError() << std::endl;
+		return FALSE;
+	}
+
+	consoleInfo.dwSize.Y = MAXSHORT - 1;
+
+	if (!::SetConsoleScreenBufferSize(console, consoleInfo.dwSize))
+	{
+		std::wcerr << L"Can't set console screen buffer size! Errorcode: " << ::GetLastError() << std::endl;
+		return FALSE;
+	}
+
+	return TRUE;
+}
+
+BOOL EnableDebugPrivilege(_In_ BOOL enable)
+{
+	HANDLE handleToken = NULL;
+	LUID luid;
+
+	if (!::OpenProcessToken(::GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES, &handleToken))
+	{
+		std::wcerr << L"Can't open current process token, errorcode: " << ::GetLastError() << std::endl;
+		return FALSE;
+	}
+		
+	if (!::LookupPrivilegeValue(NULL, SE_DEBUG_NAME, &luid))
+	{
+		std::wcerr << L"Unable to get current privileges, errorcode: " << ::GetLastError() << std::endl;
+		return FALSE;
+	}
+
+	TOKEN_PRIVILEGES tokenPriv;
+	tokenPriv.PrivilegeCount = 1;
+	tokenPriv.Privileges[0].Luid = luid;
+	if (enable)
+		tokenPriv.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
+	else
+		tokenPriv.Privileges[0].Attributes = 0;
+
+	if (!::AdjustTokenPrivileges(handleToken, FALSE, &tokenPriv, sizeof(TOKEN_PRIVILEGES), NULL, NULL))
+	{
+		std::wcerr << L"Can't adjust privileges, errorcode: " << ::GetLastError() << std::endl;
+		return FALSE;
+	}
+
+	return TRUE;
+}
+
+BOOL CtrlHandler(_In_ DWORD fdwCtrlType)
+{
+	if ((fdwCtrlType == CTRL_C_EVENT) || (fdwCtrlType == CTRL_CLOSE_EVENT) || (fdwCtrlType == CTRL_BREAK_EVENT))
+	{
+		gCloseFlag = TRUE;
+		return TRUE;
+	}
+
+	return FALSE;
+}
+
+void MessageOutput(_In_ std::wofstream& sFile, _In_ MSG_STRUCT& msg, _In_ std::set<ProcessInfo>& processes)
+{
+	std::wstring messageType;
+	switch (int(msg.body.messageType.operationStatus.ioOpType))
+	{
+	case 0:
+		messageType = std::wstring(L"create");
+		break;
+	case 3:
+		messageType = std::wstring(L"read");
+		break;
+	case 4:
+		messageType = std::wstring(L"write");
+		break;
+	default:
+		messageType = std::to_wstring(int(msg.body.messageType.operationStatus.ioOpType));
+		break;
+	}
+
+	std::wstring processPath = std::wstring(L"Not available");
+	std::set<ProcessInfo>::iterator targetProcess;
+	targetProcess = std::find(processes.begin(), processes.end(), ProcessInfo((int) msg.body.messageType.operationStatus.pid, L""));
+	if (targetProcess != processes.end())
+		processPath = targetProcess->getPath();
+
+	time_t rawtime;
+	tm timestruct;
+	time(&rawtime);
+	localtime_s(&timestruct, &rawtime);
+
+	WCHAR mountPoint[MAX_PATH];
+	memset(mountPoint, 0, sizeof(WCHAR) * MAX_PATH);
+	DWORD recevied = 0;
+	std::wstring volumePath = L"\\\\" + std::wstring(msg.body.messageType.operationStatus.guid + 2) + L"\\";
+
+	if ((::GetVolumePathNamesForVolumeNameW(volumePath.c_str(), mountPoint, MAX_PATH, &recevied)) && (recevied > 0))
+		volumePath = std::wstring(mountPoint);
+	else if (::GetLastError() != ERROR_MORE_DATA)
+		std::wcerr << L"Can't resolve guid to mount point, guid used as path. Errorcode: " << ::GetLastError() << std::endl;
+
+	if (sFile.is_open())
+	{
+		sFile << timestruct.tm_hour << L":" << timestruct.tm_min << L":" << timestruct.tm_sec << L";";
+		sFile << timestruct.tm_mday << L"." << timestruct.tm_mon + 1 << L"." << timestruct.tm_year + 1900 << L";";
+		sFile << msg.body.messageType.operationStatus.pid << L";" << processPath << L";";
+		sFile << messageType << L";";
+		sFile << volumePath + std::wstring(msg.body.messageType.operationStatus.path) << L";" << std::endl;
+	}
+
+	std::wcout << L"operation: " << messageType << std::endl;
+	std::wcout << L"process ID: " << msg.body.messageType.operationStatus.pid << std::endl;
+	std::wcout << L"path: " << volumePath + std::wstring(msg.body.messageType.operationStatus.path) << std::endl << std::endl;
+}
+
+int _cdecl main(_In_ int argc, _In_reads_(argc) char *argv[])
+{
+	if (!SetMaxConsoleSize())
+		std::wcerr << L"Can't set large console window size!" << std::endl;
+
+	if (!EnableDebugPrivilege(TRUE))
+		std::wcerr << L"Can't set SE_DEBUG_PRIVILEGE, monitoring for some processes will be unavailiable!" << std::endl;
+
+	if (!::SetConsoleCtrlHandler((PHANDLER_ROUTINE)CtrlHandler, TRUE))
+	{
+		std::wcerr << L"Can't set console ctrl handler. Errorcode: " << ::GetLastError() << std::endl;
+		return -1;
+	}
+
+	HANDLE hSnapshot = ::CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+	if (hSnapshot == INVALID_HANDLE_VALUE)
+	{
+		std::wcerr << L"Error on CreateToolhelp32Snapshot call. Errorcode: " << ::GetLastError() << std::endl;
+		return -2;
+	}
+
+	PROCESSENTRY32 proc;
+	proc.dwSize = sizeof(PROCESSENTRY32);
+	std::set<ProcessInfo> procInfo;
+
+	if (!::Process32FirstW(hSnapshot, &proc))
+	{
+		std::wcerr << L"Process32FirstW fails. Errorcode: " << ::GetLastError() << std::endl;
+		::CloseHandle(hSnapshot);
+		return -3;
+	}
+
+	HANDLE hProcess = NULL;
+	wchar_t image_path[MAX_PATH];
+
+	do
+	{
+		memset(image_path, 0, sizeof(wchar_t)* MAX_PATH);
+		hProcess = ::OpenProcess(PROCESS_ALL_ACCESS, 0, proc.th32ProcessID);
+		if (hProcess == NULL)
+		{
+			std::wcerr << L"Can't open process with PID: " << int(proc.th32ProcessID) << L" error: " << ::GetLastError() << std::endl;
+			continue;
+		}
+
+		if (::GetModuleFileNameExW(hProcess, 0, image_path, MAX_PATH) == 0)
+		{
+			std::wcerr << L"Can't get process path with PID: " << int(proc.th32ProcessID) << L" error: " << ::GetLastError() << std::endl;
+			::CloseHandle(hProcess);
+			continue;
+		}
+
+		::CloseHandle(hProcess);
+
+		procInfo.insert(ProcessInfo((int)proc.th32ProcessID, image_path));
+	} while (::Process32NextW(hSnapshot, &proc));
+
+	::CloseHandle(hSnapshot);
+	
+	if (!EnableDebugPrivilege(FALSE))
+		std::wcerr << L"Can't drop SE_DEBUG_PRIVILEGE!" << std::endl;
+
+	for (std::set<ProcessInfo>::iterator i = procInfo.begin(); i != procInfo.end(); i++)
+		std::wcout << i->getPid() << L" " << i->getPath() << std::endl;
+	std::wcout << L"* All processes monitoring" << std::endl;
+
+	int target = -1;
+	std::wcout << L"Write PID of choosen process:" << std::endl;
+	std::wcin >> target;
+
+	std::set<ProcessInfo>::iterator targetProc;
+	if (target != -1)
+	{
+		targetProc = std::find(procInfo.begin(), procInfo.end(), ProcessInfo(target, L""));
+		if (targetProc == procInfo.end())
+		{
+			std::wcerr << L"Incorrect PID!" << std::endl;
+			return -4;
+		}
+	}
+
+	std::wcout << std::endl;
+
+	HANDLE port = INVALID_HANDLE_VALUE;
+	HRESULT hr;
+	DWORD bytes_returned;
+	std::wofstream fileOut;
+
+	if (argc > 1)
+	{
+		try
+		{
+			fileOut.open(argv[1], std::wofstream::app);
+		}
+		catch (std::wofstream::failure e)
+		{
+			std::wcerr << L"Can't open log file. Errorcode: " << e.code().value() << std::endl;
+		}
+	}
+
+	//  Open a commuication channel to the filter
+
+	std::wcout << L"Connecting to the filter ..." << std::endl;
+	hr = FilterConnectCommunicationPort(L"\\FileSystemDriver", 0, NULL, 0, NULL, &port);
+	if (IS_ERROR(hr))
+	{
+		std::wcerr << L"Connecting to filter port fails:" << std::hex << hr << std::endl;
+		if (fileOut.is_open())
+			fileOut.close();
+		return -5;
+	}
+
+	OVERLAPPED overlap;
+	memset(&overlap, 0, sizeof(OVERLAPPED));
+	overlap.hEvent = ::CreateEvent(NULL, FALSE, FALSE, NULL);
+	
+	time_t rawtime;
+	tm timestruct;
+	
+	if (fileOut.is_open())
+	{
+		time(&rawtime);
+		localtime_s(&timestruct, &rawtime);
+		fileOut << L"Capturing started:;";
+		fileOut << timestruct.tm_hour << L":" << timestruct.tm_min << L":" << timestruct.tm_sec << L";";
+		fileOut << timestruct.tm_mday << L"." << timestruct.tm_mon + 1 << L"." << timestruct.tm_year + 1900;
+		fileOut << L";PID:;";
+		if (target == -1)
+			fileOut << L"All;" << std::endl;
+		else
+			fileOut << target << L";Path:;" << targetProc->getPath() << L";" << std::endl;
+		fileOut << L"Time;Date;Process ID;Process path;Operation;File path;" << std::endl;
+	}
+
+	MSG_STRUCT msg;
+
+	msg.body.messageType.processPid.pid = target;
+	HRESULT hResult = FilterSendMessage(port, &msg.body, sizeof(msg.body), &msg.body, sizeof(msg.body), &bytes_returned);
+	if ((msg.body.messageType.driverReply.status != 0) || IS_ERROR(hResult))
+	{
+		std::wcerr << L"Can't set pid.";
+		if (IS_ERROR(hResult))
+			std::wcerr << L" Send message fails with errorcode: " << hResult;
+		else
+			std::wcerr << L" Incorrect driver answer!" << std::endl;
+		std::wcerr << std::endl;
+
+		if (fileOut.is_open())
+			fileOut.close();
+		::CloseHandle(port);
+		return -6;
+	}
+
+	std::wcout << L"Listening... " << std::endl;
+	
+	while (!gCloseFlag)
+	{
+		if (HRESULT_FROM_WIN32(ERROR_IO_PENDING) != FilterGetMessage(port, (PFILTER_MESSAGE_HEADER)&msg, sizeof(MSG_STRUCT), &overlap))
+		{
+			std::wcerr << L"FilterGetMessage fails with errorcode: " << ::GetLastError() << std::endl;
+			break;
+		}
+		
+		DWORD sts = WAIT_TIMEOUT;
+		while ((sts == WAIT_TIMEOUT) && (!gCloseFlag))
+			sts = ::WaitForSingleObject(overlap.hEvent, MSG_WAIT_TIMEOUT);
+		
+		if (gCloseFlag)
+		{
+			std::wcout << L"Closed by user." << std::endl;
+			break;
+		}
+				
+		if (sts != WAIT_OBJECT_0)
+		{
+			std::wcerr << L"WaitForSingleObject fails with errorcode: " << ::GetLastError() << std::endl;
+			break;
+		}
+	
+		MessageOutput(fileOut, msg, procInfo);
+	}
+
+	if (fileOut.is_open())
+	{
+		time(&rawtime);
+		localtime_s(&timestruct, &rawtime);
+		fileOut << L"Capturing stopped:;";
+		fileOut << timestruct.tm_hour << L":" << timestruct.tm_min << L":" << timestruct.tm_sec << L";";
+		fileOut << timestruct.tm_mday << L"." << timestruct.tm_mon + 1 << L"." << timestruct.tm_year + 1900 << L";" << std::endl;
+		fileOut.close();
+	}
+	::CloseHandle(port);
+	::CloseHandle(overlap.hEvent);
+
+	return 0;
+}
+
